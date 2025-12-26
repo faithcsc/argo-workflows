@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 
+	lru "github.com/hashicorp/golang-lru/v2"
+
 	"github.com/argoproj/argo-workflows/v3/util/env"
 
 	apiv1 "k8s.io/api/core/v1"
@@ -19,14 +21,24 @@ import (
 // by default, allow a source to send 10000 events about an object
 const defaultSpamBurst = 10000
 
+// defaultEventRecorderCacheSize limits memory growth from event recorders.
+// Each entry holds an EventBroadcaster with goroutines.
+// 1024 supports large multi-tenant clusters while bounding resource usage.
+const defaultEventRecorderCacheSize = 50
+
 type EventRecorderManager interface {
 	Get(ctx context.Context, namespace string) record.EventRecorder
+}
+
+type eventRecorderEntry struct {
+	broadcaster record.EventBroadcaster
+	recorder    record.EventRecorder
 }
 
 type eventRecorderManager struct {
 	kubernetes     kubernetes.Interface
 	lock           sync.Mutex
-	eventRecorders map[string]record.EventRecorder
+	eventRecorders *lru.Cache[string, *eventRecorderEntry]
 }
 
 // customEventAggregatorFuncWithAnnotations enhances the default `EventAggregatorByReasonFunc` by
@@ -62,9 +74,8 @@ func customEventAggregatorFuncWithAnnotations(event *apiv1.Event) (string, strin
 func (m *eventRecorderManager) Get(ctx context.Context, namespace string) record.EventRecorder {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	eventRecorder, ok := m.eventRecorders[namespace]
-	if ok {
-		return eventRecorder
+	if entry, ok := m.eventRecorders.Get(namespace); ok {
+		return entry.recorder
 	}
 
 	setupKlogAdapter(ctx)
@@ -74,14 +85,21 @@ func (m *eventRecorderManager) Get(ctx context.Context, namespace string) record
 
 	eventBroadcaster.StartStructuredLogging(klog.Level(0)) // Info level
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: m.kubernetes.CoreV1().Events(namespace)})
-	m.eventRecorders[namespace] = eventBroadcaster.NewRecorder(scheme.Scheme, apiv1.EventSource{Component: "workflow-controller"})
-	return m.eventRecorders[namespace]
+	entry := &eventRecorderEntry{
+		broadcaster: eventBroadcaster,
+		recorder:    eventBroadcaster.NewRecorder(scheme.Scheme, apiv1.EventSource{Component: "workflow-controller"}),
+	}
+	m.eventRecorders.Add(namespace, entry)
+	return entry.recorder
 }
 
 func NewEventRecorderManager(kubernetes kubernetes.Interface) EventRecorderManager {
+	cache, _ := lru.NewWithEvict[string, *eventRecorderEntry](defaultEventRecorderCacheSize, func(_ string, entry *eventRecorderEntry) {
+		entry.broadcaster.Shutdown()
+	})
 	return &eventRecorderManager{
 		kubernetes:     kubernetes,
 		lock:           sync.Mutex{},
-		eventRecorders: make(map[string]record.EventRecorder),
+		eventRecorders: cache,
 	}
 }
